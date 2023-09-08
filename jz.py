@@ -1,12 +1,17 @@
+import logging
+import json
 from typing import List, Optional
 import os
-import re
 import requests
-import bs4
-import chompjs
 import pydantic
 import datetime
 import humps
+from functools import reduce
+
+
+logging.basicConfig(level = logging.INFO)
+logger = logging.getLogger(__name__)
+CACHE_DIR = os.path.expanduser("~/.cache/jz")
 
 class Speaker(pydantic.BaseModel):
     name: str
@@ -16,6 +21,7 @@ class Session(pydantic.BaseModel):
     intended_audience: Optional[str]               = None
     length:            Optional[int]               = None
     format:            Optional[str]               = None
+    abstract:          Optional[str]               = None
     language:          Optional[str]               = None
     title:             Optional[str]               = None
     room:              Optional[str]               = None
@@ -32,50 +38,47 @@ class Session(pydantic.BaseModel):
 class Program(pydantic.BaseModel):
     sessions: List[Session]
 
+    def __add__(self, other: "Program"):
+        return Program(sessions = self.sessions + other.sessions)
 
-def fetch_program(cache_folder: str, url: str, year: int = 2023):
-    cache_path = os.path.join(cache_folder, f"{year}.json")
+def filecache(folder: str, model):
+    def wrapper(fn):
+        def inner(arg):
+            cache_file_location = os.path.join(folder,arg) + ".json"
+            try:
+                with open(cache_file_location) as f:
+                    result = model.model_validate_json(f.read())
+                logger.info(f"Fetched {arg} from cache")
+            except (FileNotFoundError, pydantic.ValidationError, json.JSONDecodeError):
+                logger.info(f"{arg} not in cache, fetching from web")
+                result = fn(arg)
+                if result is not None:
+                    with open(cache_file_location, "w") as f:
+                        f.write(result.model_dump_json(by_alias = True))
+            return result
+        return inner
+    return wrapper
+
+class Conference(pydantic.BaseModel):
+    id: str
+    name: str
+    slug: str
+
+class Conferences(pydantic.BaseModel):
+    conferences: List[Conference]
+
+@filecache(CACHE_DIR, Program)
+def fetch_conference_program(slug: str) -> Program:
     try:
-        with open(cache_path) as f:
-            program = Program.model_validate_json(f.read())
-    except FileNotFoundError:
-        rsp = requests.get(url)
-        soup = bs4.BeautifulSoup(rsp.content)
-        scripts = soup.find_all("script")
-        objects = chompjs.parse_js_object(chompjs.parse_js_object(scripts[-1].text)[1])
-        program = Program(sessions = sessions([*objects]))
-        with open(cache_path,"w") as f:
-            f.write(program.model_dump_json(by_alias = True))
-    return program
+        raw = requests.get(f"https://sleepingpill.javazone.no/public/allSessions/{slug}").content
+        return Program.model_validate_json(raw)
+    except pydantic.ValidationError:
+        return None
 
-def find_json(code):
-    return re.findall("\\{[^\\}]+\\}",code)
-
-def dequote(code,marker:str="DEEPQUOTEMARKER"):
-    return code.replace("\\\\\\",marker).replace("\\","").replace(marker,"\\")
-
-def sessions(objects):
-    return dictfind("sessions", objects)
-
-
-def dictfind(key: str, x):
-    if type(x) is list:
-        for item in x:
-            found = dictfind(key, item)
-            if found:
-                return found
-    elif type(x) is dict:
-        found = x.get(key)
-        if not found:
-            for subkey in x:
-                found = dictfind(key, x[subkey])
-                if found:
-                    return found 
-        else:
-            return found
-    return None
+def fetch_all_sessions():
+    conferences = Conferences.model_validate_json(requests.get("https://sleepingpill.javazone.no/public/allSessions").content)
+    conference_programs = [fetch_conference_program(c.slug) for c in conferences.conferences]
+    return reduce(lambda a,b: a+b, [p for p in conference_programs if p is not None])
 
 if __name__ == "__main__":
-    cache_folder = os.path.expanduser("~/.cache/jz")
-    os.makedirs(cache_folder, exist_ok = True)
-    print(fetch_program(cache_folder, "https://2023.javazone.no/program").json())
+    print(fetch_all_sessions().json())
